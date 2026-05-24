@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""Small terminal UI for sending common ydotool input events."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import os
+import re
+import shlex
+import subprocess
+import sys
+import textwrap
+from dataclasses import dataclass
+from typing import Callable, Iterable, Sequence
+
+
+KEYS = {
+    "esc": 1,
+    "1": 2,
+    "2": 3,
+    "3": 4,
+    "4": 5,
+    "5": 6,
+    "6": 7,
+    "7": 8,
+    "8": 9,
+    "9": 10,
+    "0": 11,
+    "minus": 12,
+    "equal": 13,
+    "backspace": 14,
+    "tab": 15,
+    "q": 16,
+    "w": 17,
+    "e": 18,
+    "r": 19,
+    "t": 20,
+    "y": 21,
+    "u": 22,
+    "i": 23,
+    "o": 24,
+    "p": 25,
+    "leftbrace": 26,
+    "rightbrace": 27,
+    "enter": 28,
+    "ctrl": 29,
+    "a": 30,
+    "s": 31,
+    "d": 32,
+    "f": 33,
+    "g": 34,
+    "h": 35,
+    "j": 36,
+    "k": 37,
+    "l": 38,
+    "semicolon": 39,
+    "apostrophe": 40,
+    "grave": 41,
+    "shift": 42,
+    "backslash": 43,
+    "z": 44,
+    "x": 45,
+    "c": 46,
+    "v": 47,
+    "b": 48,
+    "n": 49,
+    "m": 50,
+    "comma": 51,
+    "dot": 52,
+    "slash": 53,
+    "rightshift": 54,
+    "kpasterisk": 55,
+    "alt": 56,
+    "space": 57,
+    "capslock": 58,
+    "f1": 59,
+    "f2": 60,
+    "f3": 61,
+    "f4": 62,
+    "f5": 63,
+    "f6": 64,
+    "f7": 65,
+    "f8": 66,
+    "f9": 67,
+    "f10": 68,
+    "numlock": 69,
+    "scrolllock": 70,
+    "f11": 87,
+    "f12": 88,
+    "kpenter": 96,
+    "rightctrl": 97,
+    "sysrq": 99,
+    "rightalt": 100,
+    "home": 102,
+    "up": 103,
+    "pageup": 104,
+    "left": 105,
+    "right": 106,
+    "end": 107,
+    "down": 108,
+    "pagedown": 109,
+    "insert": 110,
+    "delete": 111,
+    "leftmeta": 125,
+    "rightmeta": 126,
+}
+
+
+BUTTONS = {
+    "left": "0xC0",
+    "right": "0xC1",
+    "middle": "0xC2",
+    "back": "0xC6",
+    "forward": "0xC5",
+}
+
+
+MODE_EXIT = "\x1d"  # Ctrl+]
+MOUSE_ACCEL_REPEAT_EVERY = 3
+MOUSE_ACCEL_MAX_MULTIPLIER = 64
+
+KEY_ALIASES = {
+    "control": ["ctrl"],
+    "ctl": ["ctrl"],
+    "escape": ["esc"],
+    "return": ["enter"],
+    "ret": ["enter"],
+    "del": ["delete"],
+    "pgup": ["pageup"],
+    "pgdn": ["pagedown"],
+    "super": ["leftmeta"],
+    "meta": ["leftmeta"],
+    "win": ["leftmeta"],
+    "windows": ["leftmeta"],
+    "cmd": ["leftmeta"],
+    "command": ["leftmeta"],
+    "option": ["alt"],
+    "plus": ["shift", "equal"],
+    "_": ["shift", "minus"],
+    "underscore": ["shift", "minus"],
+    ",": ["comma"],
+    "<": ["shift", "comma"],
+    ".": ["dot"],
+    ">": ["shift", "dot"],
+    "/": ["slash"],
+    "?": ["shift", "slash"],
+    "\\": ["backslash"],
+    "|": ["shift", "backslash"],
+    ";": ["semicolon"],
+    ":": ["shift", "semicolon"],
+    "'": ["apostrophe"],
+    '"': ["shift", "apostrophe"],
+    "`": ["grave"],
+    "~": ["shift", "grave"],
+    "[": ["leftbrace"],
+    "{": ["shift", "leftbrace"],
+    "]": ["rightbrace"],
+    "}": ["shift", "rightbrace"],
+}
+
+MODIFIER_SHORTHANDS = {
+    "a": ["alt"],
+    "c": ["ctrl"],
+    "m": ["leftmeta"],
+    "s": ["shift"],
+}
+
+
+@dataclass(frozen=True)
+class Action:
+    label: str
+    detail: str
+    run: Callable[["Controller"], None]
+
+
+class Controller:
+    def __init__(
+        self,
+        ssh_target: str | None,
+        ydotool: str,
+        dry_run: bool,
+        socket_path: str | None,
+        key_delay: int,
+    ) -> None:
+        self.ssh_target = ssh_target
+        self.ydotool = ydotool
+        self.dry_run = dry_run
+        self.socket_path = socket_path
+        self.key_delay = key_delay
+        self.last_command = ""
+        self.last_status = "Ready"
+
+    def key(self, names: Sequence[str]) -> None:
+        events = [f"{KEYS[name]}:1" for name in names]
+        events.extend(f"{KEYS[name]}:0" for name in reversed(names))
+        self.run(["key", "--key-delay", str(self.key_delay), *events])
+
+    def type_text(self, text: str) -> None:
+        if text:
+            self.run(["type", text])
+
+    def click(self, button: str, repeat: int = 1) -> None:
+        command = ["click"]
+        if repeat != 1:
+            command.extend(["--repeat", str(repeat)])
+        command.append(BUTTONS[button])
+        self.run(command)
+
+    def move(self, dx: int, dy: int) -> None:
+        self.run(["mousemove", "--", str(dx), str(dy)])
+
+    def wheel(self, x: int, y: int) -> None:
+        self.run(["mousemove", "--wheel", "--", str(x), str(y)])
+
+    def run(self, ydotool_args: Sequence[str]) -> None:
+        command = [self.ydotool, *ydotool_args]
+        env_prefix: list[str] = []
+        if self.socket_path:
+            env_prefix = [f"YDOTOOL_SOCKET={self.socket_path}"]
+
+        display_command = " ".join(shlex.quote(part) for part in [*env_prefix, *command])
+        local_command = command
+        env = os.environ.copy()
+        if self.socket_path:
+            env["YDOTOOL_SOCKET"] = self.socket_path
+
+        if self.ssh_target:
+            remote = " ".join(shlex.quote(part) for part in [*env_prefix, *command])
+            local_command = ["ssh", self.ssh_target, remote]
+            display_command = " ".join(shlex.quote(part) for part in local_command)
+
+        self.last_command = display_command
+        if self.dry_run:
+            self.last_status = "Dry run"
+            return
+
+        try:
+            result = subprocess.run(
+                local_command,
+                env=env if not self.ssh_target else None,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            self.last_status = f"Command not found: {exc.filename}"
+            return
+
+        output = (result.stderr or result.stdout).strip()
+        if result.returncode == 0:
+            self.last_status = "Sent"
+        elif output:
+            self.last_status = output.splitlines()[-1][:160]
+        else:
+            self.last_status = f"Failed with exit code {result.returncode}"
+
+
+def press(names: Sequence[str]) -> Callable[[Controller], None]:
+    return lambda controller: controller.key(names)
+
+
+def click(button: str, repeat: int = 1) -> Callable[[Controller], None]:
+    return lambda controller: controller.click(button, repeat)
+
+
+FREE_TYPE_KEYS = {
+    curses.KEY_BACKSPACE: ["backspace"],
+    curses.KEY_BTAB: ["shift", "tab"],
+    curses.KEY_DC: ["delete"],
+    curses.KEY_DOWN: ["down"],
+    curses.KEY_END: ["end"],
+    curses.KEY_ENTER: ["enter"],
+    curses.KEY_HOME: ["home"],
+    curses.KEY_IC: ["insert"],
+    curses.KEY_LEFT: ["left"],
+    curses.KEY_NPAGE: ["pagedown"],
+    curses.KEY_PPAGE: ["pageup"],
+    curses.KEY_RIGHT: ["right"],
+    curses.KEY_UP: ["up"],
+    **{curses.KEY_F0 + index: [f"f{index}"] for index in range(1, 13)},
+}
+
+
+def build_actions() -> list[Action]:
+    return [
+        Action("Enter", "Press Enter", press(["enter"])),
+        Action("Esc", "Press Escape", press(["esc"])),
+        Action("Tab", "Press Tab", press(["tab"])),
+        Action("Backspace", "Press Backspace", press(["backspace"])),
+        Action("Delete", "Press Delete", press(["delete"])),
+        Action("Space", "Press Space", press(["space"])),
+        Action("Up", "Arrow up", press(["up"])),
+        Action("Down", "Arrow down", press(["down"])),
+        Action("Left", "Arrow left", press(["left"])),
+        Action("Right", "Arrow right", press(["right"])),
+        Action("Home", "Press Home", press(["home"])),
+        Action("End", "Press End", press(["end"])),
+        Action("PgUp", "Press Page Up", press(["pageup"])),
+        Action("PgDn", "Press Page Down", press(["pagedown"])),
+        Action("Ctrl+C", "Interrupt", press(["ctrl", "c"])),
+        Action("Ctrl+D", "EOF", press(["ctrl", "d"])),
+        Action("Ctrl+L", "Clear terminal", press(["ctrl", "l"])),
+        Action("Ctrl+Alt+T", "Open terminal shortcut", press(["ctrl", "alt", "t"])),
+        Action("Alt+Tab", "Switch window", press(["alt", "tab"])),
+        Action("Alt+F4", "Close window", press(["alt", "f4"])),
+        Action("Click left", "Mouse left click", click("left")),
+        Action("Double click", "Mouse left double click", click("left", 2)),
+        Action("Click right", "Mouse right click", click("right")),
+        Action("Click middle", "Mouse middle click", click("middle")),
+    ]
+
+
+def prompt(stdscr: curses.window, title: str, default: str = "") -> str | None:
+    height, width = stdscr.getmaxyx()
+    box_width = min(max(50, len(title) + 4), width - 4)
+    y = max(1, height // 2 - 2)
+    x = max(0, (width - box_width) // 2)
+
+    curses.echo()
+    curses.curs_set(1)
+    try:
+        win = curses.newwin(5, box_width, y, x)
+        win.box()
+        label = title
+        if default:
+            label = f"{title} [{default}]"
+        win.addstr(1, 2, label[: box_width - 4])
+        win.move(3, 2)
+        win.refresh()
+        value = win.getstr(3, 2, box_width - 4).decode(errors="replace")
+        return value if value else default
+    except KeyboardInterrupt:
+        return None
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+
+
+def parse_key_combo(combo: str) -> list[str]:
+    tokens = [part for part in re.split(r"[+\-\s]+", combo.strip().lower()) if part]
+    if not tokens:
+        raise ValueError("Expected a key combo")
+
+    names: list[str] = []
+    for index, token in enumerate(tokens):
+        if index < len(tokens) - 1 and token in MODIFIER_SHORTHANDS:
+            expanded = MODIFIER_SHORTHANDS[token]
+        else:
+            expanded = KEY_ALIASES.get(token, [token])
+
+        for name in expanded:
+            if name not in KEYS:
+                raise ValueError(f"Unknown key: {token}")
+            names.append(name)
+
+    return names
+
+
+def draw(
+    stdscr: curses.window,
+    actions: Sequence[Action],
+    selected: int,
+    controller: Controller,
+    filter_text: str,
+    step: int,
+    input_mode: str = "menu",
+) -> list[int]:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+
+    title = "ydotool-tui"
+    target = controller.ssh_target or "local"
+    mode = "dry-run" if controller.dry_run else "send"
+    header = f"{title}  target={target}  mode={mode}  input={input_mode}  step={step}px"
+    stdscr.addnstr(0, 0, header, width - 1, curses.A_BOLD)
+    if input_mode == "free":
+        help_line = "Free typing: keys send immediately  Ctrl+]: menu  Enter/Tab/Backspace/arrows supported"
+    elif input_mode == "mouse":
+        help_line = "Mouse: WASD/arrows move  Space/C/R/X/B/F/2 click  H/J/K/L wheel  q/Ctrl+]: menu"
+    else:
+        help_line = "Arrows/select: navigate  Enter: send  /: filter  k: key combo  t: free typing  m: mouse  c: click  q: quit"
+    stdscr.addnstr(1, 0, help_line, width - 1)
+
+    if filter_text:
+        stdscr.addnstr(2, 0, f"Filter: {filter_text}", width - 1)
+    else:
+        stdscr.addnstr(2, 0, "Filter: all", width - 1)
+
+    matches = [
+        index
+        for index, action in enumerate(actions)
+        if not filter_text
+        or filter_text.lower() in action.label.lower()
+        or filter_text.lower() in action.detail.lower()
+    ]
+
+    list_top = 4
+    list_height = max(1, height - 8)
+    if not matches:
+        stdscr.addnstr(list_top, 0, "No actions match the filter.", width - 1)
+    else:
+        if selected not in matches:
+            selected = matches[0]
+        selected_offset = matches.index(selected)
+        first = max(0, min(selected_offset - list_height // 2, len(matches) - list_height))
+        visible = matches[first : first + list_height]
+
+        label_width = min(24, max(12, width // 3))
+        for row, action_index in enumerate(visible, start=list_top):
+            action = actions[action_index]
+            marker = ">" if action_index == selected else " "
+            attr = curses.A_REVERSE if action_index == selected else curses.A_NORMAL
+            line = f"{marker} {action.label:<{label_width}} {action.detail}"
+            stdscr.addnstr(row, 0, line, width - 1, attr)
+
+    status_y = height - 3
+    command_y = height - 2
+    stdscr.hline(height - 4, 0, curses.ACS_HLINE, width)
+    stdscr.addnstr(status_y, 0, f"Status: {controller.last_status}", width - 1)
+    stdscr.addnstr(command_y, 0, f"Last: {controller.last_command}", width - 1)
+    stdscr.refresh()
+    return matches
+
+
+def show_help(stdscr: curses.window) -> None:
+    help_text = """
+    Keys
+
+    Enter        send selected action
+    Up/Down      move selection
+    PageUp/PageDown jump selection
+    /            filter actions
+    k            send key combo, e.g. ctrl-alt-t, c-a-t, or alt-f2
+    t            free typing, send keys as you press them
+    Ctrl+]       leave free typing
+    m            mouse mode, move with WASD/arrows
+    Space/Enter  left click in mouse mode
+    c/r/x/b/f/2  left/right/middle/back/forward/double click in mouse mode
+    h/j/k/l      wheel left/down/up/right in mouse mode
+    q or Ctrl+]  leave mouse mode
+    c            click button name: left, right, middle, back, forward
+    q            quit
+
+    The ydotool daemon must be running on the target. For remote use, run this
+    TUI with --ssh user@host; it will execute ydotool commands over SSH.
+    """
+    lines = textwrap.dedent(help_text).strip().splitlines()
+    height, width = stdscr.getmaxyx()
+    box_height = min(height - 2, len(lines) + 4)
+    box_width = min(width - 4, 78)
+    y = max(1, (height - box_height) // 2)
+    x = max(0, (width - box_width) // 2)
+    win = curses.newwin(box_height, box_width, y, x)
+    win.box()
+    for row, line in enumerate(lines[: box_height - 4], start=1):
+        win.addnstr(row, 2, line, box_width - 4, curses.A_BOLD if line and not line.startswith(" ") else curses.A_NORMAL)
+    win.addnstr(box_height - 2, 2, "Press any key", box_width - 4)
+    win.refresh()
+    win.getch()
+
+
+def send_free_key(controller: Controller, key: int | str) -> bool:
+    if isinstance(key, int):
+        names = FREE_TYPE_KEYS.get(key)
+        if names:
+            controller.key(names)
+            return True
+        controller.last_status = f"Unsupported free typing key code: {key}"
+        return True
+
+    if key == MODE_EXIT:
+        controller.last_status = "Left free typing"
+        return False
+    if key in ("\n", "\r"):
+        controller.key(["enter"])
+    elif key == "\t":
+        controller.key(["tab"])
+    elif key in ("\b", "\x7f"):
+        controller.key(["backspace"])
+    elif key == "\x1b":
+        controller.key(["esc"])
+    elif len(key) == 1 and 1 <= ord(key) <= 26:
+        controller.key(["ctrl", chr(ord("a") + ord(key) - 1)])
+    elif key.isprintable():
+        controller.type_text(key)
+    else:
+        controller.last_status = f"Unsupported free typing key: {ord(key):#x}"
+    return True
+
+
+def run_free_mode(
+    stdscr: curses.window,
+    actions: Sequence[Action],
+    selected: int,
+    controller: Controller,
+    filter_text: str,
+    step: int,
+) -> None:
+    controller.last_status = "Free typing"
+    curses.raw()
+    try:
+        while True:
+            draw(stdscr, actions, selected, controller, filter_text, step, input_mode="free")
+            if not send_free_key(controller, stdscr.get_wch()):
+                break
+    finally:
+        curses.cbreak()
+        curses.noecho()
+        curses.curs_set(0)
+
+
+def mouse_direction_for_key(key: int | str) -> tuple[int, int] | None:
+    match key:
+        case "w" | "W" | curses.KEY_UP:
+            return (0, -1)
+        case "a" | "A" | curses.KEY_LEFT:
+            return (-1, 0)
+        case "s" | "S" | curses.KEY_DOWN:
+            return (0, 1)
+        case "d" | "D" | curses.KEY_RIGHT:
+            return (1, 0)
+        case _:
+            return None
+
+
+MOUSE_CLICKS = {
+    " ": ("left", 1, "Left click"),
+    "\n": ("left", 1, "Left click"),
+    "c": ("left", 1, "Left click"),
+    "2": ("left", 2, "Double click"),
+    "r": ("right", 1, "Right click"),
+    "x": ("middle", 1, "Middle click"),
+    "b": ("back", 1, "Back click"),
+    "f": ("forward", 1, "Forward click"),
+}
+
+
+MOUSE_WHEELS = {
+    "h": (1, 0, "Wheel left"),
+    "j": (0, -1, "Wheel down"),
+    "k": (0, 1, "Wheel up"),
+    "l": (-1, 0, "Wheel right"),
+}
+
+
+def run_mouse_mode(
+    stdscr: curses.window,
+    actions: Sequence[Action],
+    selected: int,
+    controller: Controller,
+    filter_text: str,
+    step: int,
+) -> None:
+    controller.last_status = "Mouse mode"
+    last_direction: tuple[int, int] | None = None
+    repeat_count = 0
+    curses.raw()
+    try:
+        while True:
+            draw(stdscr, actions, selected, controller, filter_text, step, input_mode="mouse")
+            key = stdscr.get_wch()
+
+            if key in (MODE_EXIT, "q", "Q"):
+                controller.last_status = "Left mouse mode"
+                break
+
+            direction = mouse_direction_for_key(key)
+            if direction is not None:
+                if direction == last_direction:
+                    repeat_count += 1
+                else:
+                    repeat_count = 0
+                last_direction = direction
+
+                multiplier = min(
+                    MOUSE_ACCEL_MAX_MULTIPLIER,
+                    1 + repeat_count // MOUSE_ACCEL_REPEAT_EVERY,
+                )
+                controller.move(direction[0] * step * multiplier, direction[1] * step * multiplier)
+                controller.last_status = f"Moved {step * multiplier}px"
+                continue
+
+            last_direction = None
+            repeat_count = 0
+            if key == curses.KEY_ENTER:
+                key = "\n"
+            elif isinstance(key, str) and key.isalpha():
+                key = key.lower()
+
+            if isinstance(key, str) and key in MOUSE_CLICKS:
+                button, repeat, status = MOUSE_CLICKS[key]
+                controller.click(button, repeat)
+                controller.last_status = status
+            elif isinstance(key, str) and key in MOUSE_WHEELS:
+                x, y, status = MOUSE_WHEELS[key]
+                controller.wheel(x, y)
+                controller.last_status = status
+            else:
+                label = key if isinstance(key, str) and key.isprintable() else repr(key)
+                controller.last_status = f"Mouse mode ignores {label}"
+    finally:
+        curses.cbreak()
+        curses.noecho()
+        curses.curs_set(0)
+
+
+def run_tui(stdscr: curses.window, controller: Controller, step: int) -> None:
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    curses.use_default_colors()
+
+    actions = build_actions()
+    selected = 0
+    filter_text = ""
+
+    while True:
+        matches = draw(stdscr, actions, selected, controller, filter_text, step)
+        if matches and selected not in matches:
+            selected = matches[0]
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            break
+        if key in (ord("?"), ord("h")):
+            show_help(stdscr)
+            continue
+        if key == ord("/"):
+            value = prompt(stdscr, "Filter actions")
+            if value is not None:
+                filter_text = value
+                if matches:
+                    selected = matches[0]
+            continue
+        if key == ord("k"):
+            value = prompt(stdscr, "Key combo", "ctrl-alt-t")
+            if value is not None:
+                try:
+                    controller.key(parse_key_combo(value))
+                except ValueError as exc:
+                    controller.last_status = str(exc)
+            continue
+        if key == ord("t"):
+            run_free_mode(stdscr, actions, selected, controller, filter_text, step)
+            continue
+        if key == ord("m"):
+            run_mouse_mode(stdscr, actions, selected, controller, filter_text, step)
+            continue
+        if key == ord("c"):
+            value = prompt(stdscr, "Click button", "left")
+            if value is not None:
+                button = value.strip().lower()
+                if button in BUTTONS:
+                    controller.click(button)
+                else:
+                    controller.last_status = f"Unknown button: {button}"
+            continue
+        if not matches:
+            continue
+
+        current_pos = matches.index(selected) if selected in matches else 0
+        if key == curses.KEY_DOWN:
+            selected = matches[min(len(matches) - 1, current_pos + 1)]
+        elif key == curses.KEY_UP:
+            selected = matches[max(0, current_pos - 1)]
+        elif key == curses.KEY_NPAGE:
+            selected = matches[min(len(matches) - 1, current_pos + 10)]
+        elif key == curses.KEY_PPAGE:
+            selected = matches[max(0, current_pos - 10)]
+        elif key in (curses.KEY_ENTER, 10, 13):
+            actions[selected].run(controller)
+
+
+def print_actions(actions: Iterable[Action]) -> None:
+    for action in actions:
+        print(f"{action.label}\t{action.detail}")
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Terminal UI for sending common keyboard and mouse events through ydotool.",
+    )
+    parser.add_argument("--ssh", metavar="USER@HOST", help="run ydotool on a remote host over SSH")
+    parser.add_argument("--ydotool", default="ydotool", help="ydotool executable path on the target")
+    parser.add_argument("--socket", help="set YDOTOOL_SOCKET for ydotool")
+    parser.add_argument("--key-delay", type=int, default=12, help="delay in ms between key events")
+    parser.add_argument("--mouse-step", type=int, default=1, help="default mouse movement step in pixels")
+    parser.add_argument("--dry-run", action="store_true", help="show commands without executing them")
+    parser.add_argument("--list-actions", action="store_true", help="print built-in actions and exit")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] = sys.argv[1:]) -> int:
+    args = parse_args(argv)
+    if args.list_actions:
+        print_actions(build_actions())
+        return 0
+
+    controller = Controller(
+        ssh_target=args.ssh,
+        ydotool=args.ydotool,
+        dry_run=args.dry_run,
+        socket_path=args.socket,
+        key_delay=args.key_delay,
+    )
+
+    try:
+        curses.wrapper(run_tui, controller, args.mouse_step)
+    except curses.error as exc:
+        print(f"curses error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
