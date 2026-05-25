@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import curses
 import os
 import re
@@ -174,6 +175,13 @@ class Action:
     run: Callable[["Controller"], None]
 
 
+@dataclass(frozen=True)
+class CommandJob:
+    display: str
+    command: list[str]
+    env: dict[str, str] | None
+
+
 class Controller:
     def __init__(
         self,
@@ -190,6 +198,8 @@ class Controller:
         self.key_delay = key_delay
         self.last_command = ""
         self.last_status = "Ready"
+        self.pending: deque[CommandJob] = deque()
+        self.current: subprocess.Popen[str] | None = None
 
     def key(self, names: Sequence[str]) -> None:
         events = [f"{KEYS[name]}:1" for name in names]
@@ -224,36 +234,74 @@ class Controller:
         env = os.environ.copy()
         if self.socket_path:
             env["YDOTOOL_SOCKET"] = self.socket_path
+        job_env: dict[str, str] | None = env
 
         if self.ssh_target:
             remote = " ".join(shlex.quote(part) for part in [*env_prefix, *command])
             local_command = ["ssh", self.ssh_target, remote]
             display_command = " ".join(shlex.quote(part) for part in local_command)
+            job_env = None
 
         self.last_command = display_command
         if self.dry_run:
             self.last_status = "Dry run"
             return
 
+        self.pending.append(CommandJob(display_command, local_command, job_env))
+        self.last_status = f"Queued ({len(self.pending)})"
+
+    def tick(self) -> None:
+        if self.current is not None:
+            if self.current.poll() is None:
+                return
+            self.finish_current()
+
+        if not self.pending:
+            return
+
+        job = self.pending.popleft()
+        self.last_command = job.display
         try:
-            result = subprocess.run(
-                local_command,
-                env=env if not self.ssh_target else None,
-                check=False,
-                capture_output=True,
+            self.current = subprocess.Popen(
+                job.command,
+                stdin=subprocess.DEVNULL,
+                env=job.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
             )
         except FileNotFoundError as exc:
             self.last_status = f"Command not found: {exc.filename}"
+            self.current = None
             return
 
-        output = (result.stderr or result.stdout).strip()
-        if result.returncode == 0:
+        suffix = f", {len(self.pending)} queued" if self.pending else ""
+        self.last_status = f"Running{suffix}"
+
+    def finish_current(self) -> None:
+        if self.current is None:
+            return
+
+        stdout, stderr = self.current.communicate()
+        output = (stderr or stdout).strip()
+        if self.current.returncode == 0:
             self.last_status = "Sent"
         elif output:
             self.last_status = output.splitlines()[-1][:160]
         else:
-            self.last_status = f"Failed with exit code {result.returncode}"
+            self.last_status = f"Failed with exit code {self.current.returncode}"
+        self.current = None
+
+    def close(self) -> None:
+        if self.current is not None and self.current.poll() is None:
+            self.current.terminate()
+            try:
+                self.current.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.current.kill()
+                self.current.wait()
+        self.current = None
+        self.pending.clear()
 
 
 def press(names: Sequence[str]) -> Callable[[Controller], None]:
@@ -501,8 +549,13 @@ def run_free_mode(
     curses.raw()
     try:
         while True:
+            controller.tick()
             draw(stdscr, actions, selected, controller, filter_text, step, input_mode="free")
-            if not send_free_key(controller, stdscr.get_wch()):
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
+            if not send_free_key(controller, key):
                 break
     finally:
         curses.cbreak()
@@ -558,8 +611,12 @@ def run_mouse_mode(
     curses.raw()
     try:
         while True:
+            controller.tick()
             draw(stdscr, actions, selected, controller, filter_text, step, input_mode="mouse")
-            key = stdscr.get_wch()
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
 
             if key in (MODE_EXIT, "q", "Q"):
                 controller.last_status = "Left mouse mode"
@@ -608,6 +665,7 @@ def run_mouse_mode(
 def run_tui(stdscr: curses.window, controller: Controller, step: int) -> None:
     curses.curs_set(0)
     stdscr.keypad(True)
+    stdscr.timeout(50)
     curses.use_default_colors()
 
     actions = build_actions()
@@ -615,11 +673,14 @@ def run_tui(stdscr: curses.window, controller: Controller, step: int) -> None:
     filter_text = ""
 
     while True:
+        controller.tick()
         matches = draw(stdscr, actions, selected, controller, filter_text, step)
         if matches and selected not in matches:
             selected = matches[0]
 
         key = stdscr.getch()
+        if key == -1:
+            continue
         if key in (ord("q"), 27):
             break
         if key in (ord("?"), ord("h")):
@@ -711,6 +772,8 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+    finally:
+        controller.close()
     return 0
 
 

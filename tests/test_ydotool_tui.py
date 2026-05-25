@@ -3,6 +3,7 @@ from __future__ import annotations
 import runpy
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "ydotool-tui"
@@ -98,6 +99,108 @@ class ControllerDryRunTests(unittest.TestCase):
 
         controller.click("forward")
         self.assertEqual(controller.last_command, "ydotool click 0xC5")
+
+
+class ControllerQueueTests(unittest.TestCase):
+    def make_controller(self):
+        return APP["Controller"](
+            ssh_target=None,
+            ydotool="ydotool",
+            dry_run=False,
+            socket_path=None,
+            key_delay=12,
+        )
+
+    def test_commands_are_queued_until_tick_starts_them(self) -> None:
+        controller = self.make_controller()
+        controller.click("left")
+
+        self.assertEqual(controller.last_command, "ydotool click 0xC0")
+        self.assertEqual(controller.last_status, "Queued (1)")
+        self.assertEqual(len(controller.pending), 1)
+        self.assertIsNone(controller.current)
+
+    def test_tick_runs_one_command_at_a_time(self) -> None:
+        controller = self.make_controller()
+        controller.click("left")
+        controller.click("right")
+
+        first = FakeProcess()
+        second = FakeProcess()
+        with patch.object(APP["subprocess"], "Popen", side_effect=[first, second]) as popen:
+            controller.tick()
+            self.assertIs(controller.current, first)
+            self.assertEqual(controller.last_status, "Running, 1 queued")
+            self.assertEqual(popen.call_count, 1)
+            args, kwargs = popen.call_args
+            self.assertEqual(args, (["ydotool", "click", "0xC0"],))
+            self.assertEqual(kwargs["stdin"], APP["subprocess"].DEVNULL)
+            self.assertIsInstance(kwargs["env"], dict)
+            self.assertEqual(kwargs["stdout"], APP["subprocess"].PIPE)
+            self.assertEqual(kwargs["stderr"], APP["subprocess"].PIPE)
+            self.assertTrue(kwargs["text"])
+
+            first.returncode = 0
+            controller.tick()
+            self.assertIs(controller.current, second)
+            self.assertEqual(controller.last_status, "Running")
+            self.assertEqual(popen.call_count, 2)
+
+            second.returncode = 0
+            controller.tick()
+            self.assertIsNone(controller.current)
+            self.assertEqual(controller.last_status, "Sent")
+
+    def test_failed_command_reports_last_output_line(self) -> None:
+        controller = self.make_controller()
+        controller.click("left")
+
+        process = FakeProcess(returncode=2, stderr="first line\nbad option\n")
+        with patch.object(APP["subprocess"], "Popen", return_value=process):
+            controller.tick()
+            controller.tick()
+
+        self.assertEqual(controller.last_status, "bad option")
+
+    def test_close_terminates_running_command_and_clears_queue(self) -> None:
+        controller = self.make_controller()
+        controller.click("left")
+        controller.click("right")
+
+        process = FakeProcess()
+        with patch.object(APP["subprocess"], "Popen", return_value=process):
+            controller.tick()
+            controller.close()
+
+        self.assertTrue(process.terminated)
+        self.assertIsNone(controller.current)
+        self.assertEqual(len(controller.pending), 0)
+
+
+class FakeProcess:
+    def __init__(self, returncode: int | None = None, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.terminated = False
+        self.killed = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def communicate(self) -> tuple[str, str]:
+        return self.stdout, self.stderr
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: int | None = None) -> int | None:
+        return self.returncode
 
 
 class ActionAndMouseBindingTests(unittest.TestCase):
